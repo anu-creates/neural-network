@@ -67,18 +67,78 @@ def train_model(dataset, activation, init, hidden, epochs, lr, batch, n_train=No
     }
 
 
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _ci_child(parent, name):
+    """Entry of `parent` called `name`, ignoring upper/lower case (or None).
+    Hosting servers are case-sensitive, Windows is not."""
+    try:
+        for entry in os.listdir(parent):
+            if entry.lower() == name.lower():
+                return os.path.join(parent, entry)
+    except OSError:
+        pass
+    return None
+
+
+def find_cache_file(filename):
+    """Find precomputed/<filename> next to app.py or in the working directory.
+    Also accepts the file sitting directly next to app.py."""
+    for base in dict.fromkeys([APP_DIR, os.getcwd()]):
+        folder = _ci_child(base, CACHE_DIR)
+        for parent in (folder, base):
+            if parent:
+                found = _ci_child(parent, filename)
+                if found and os.path.isfile(found):
+                    return found
+    return None
+
+
 @st.cache_resource(show_spinner=False)
 def _load_precomputed(path, mtime):
-    with open(path, "rb") as f:
-        return pickle.load(f)
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception as e:  # unreadable or incompatible file: report, do not crash
+        return {"__error__": f"{type(e).__name__}: {e}"}
 
 
 def precomputed_for(dataset):
-    """Results saved by precompute.py for this dataset, or None if missing."""
-    path = os.path.join(CACHE_DIR, CACHE_FILES[dataset])
-    if not os.path.exists(path):
+    """Results saved by precompute.py for this dataset, or None if unavailable."""
+    path = find_cache_file(CACHE_FILES[dataset])
+    if path is None:
         return None
-    return _load_precomputed(path, os.path.getmtime(path))
+    data = _load_precomputed(path, os.path.getmtime(path))
+    if "__error__" in data or "results" not in data:
+        return None
+    return data
+
+
+def cache_diagnosis(dataset):
+    """Plain-text explanation of what the app can see, for debugging hosting."""
+    filename = CACHE_FILES[dataset]
+    lines = [f"Looking for: {CACHE_DIR}/{filename}",
+             f"App folder: {APP_DIR}",
+             f"Working directory: {os.getcwd()}"]
+    for base in dict.fromkeys([APP_DIR, os.getcwd()]):
+        try:
+            lines.append(f"Files in {base}: {sorted(os.listdir(base))[:30]}")
+            sub = _ci_child(base, CACHE_DIR)
+            if sub:
+                lines.append(f"Files in {sub}: {sorted(os.listdir(sub))}")
+        except OSError as e:
+            lines.append(f"Cannot list {base}: {e}")
+    path = find_cache_file(filename)
+    if path is None:
+        lines.append("Result: the file was not found in any of these places.")
+    else:
+        data = _load_precomputed(path, os.path.getmtime(path))
+        if "__error__" in data:
+            lines.append(f"Result: found {path} but could not read it: {data['__error__']}")
+        elif "results" not in data:
+            lines.append(f"Result: found {path} but it has an unexpected format.")
+    return "\n".join(lines)
 
 
 def get_result(cfg, act, init):
@@ -192,6 +252,7 @@ def toy_attention(tokens, scale, d=8):
 # Sidebar: settings shared by every tab
 # =====================================================================
 st.sidebar.title("Synapse")
+st.sidebar.caption("App version 4 (finds saved results next to app.py)")
 info_slot = st.sidebar.container()
 
 with st.sidebar.expander("Advanced: train with my own settings"):
@@ -217,7 +278,7 @@ if use_saved:
     cfg = {"dataset": DATASETS[0], "fast": True, "hidden": c["hidden"],
            "epochs": c["epochs"], "lr": c["lr"], "batch": c["batch"], "n_train": None}
 else:
-    cfg = {"dataset": dataset_choice if user_live else DATASETS[0], "fast": False,
+    cfg = {"dataset": dataset_choice if user_live else DATASETS[1], "fast": False,
            "hidden": hidden, "epochs": epochs, "lr": lr, "batch": batch,
            "n_train": n_train}
 
@@ -236,9 +297,12 @@ with info_slot:
         st.caption("Each network trains when you press Run. Results will not match "
                    "the report unless you use the same settings and all images.")
     else:
-        st.warning("No saved MNIST results found yet. Run `python precompute.py` once "
-                   "in the project folder (about 10 minutes). Until then the app "
-                   "trains small networks live.")
+        st.warning("No saved MNIST results found. On your laptop, run "
+                   "`python precompute.py` once (about 10 minutes). On a hosted link, "
+                   "make sure `precomputed/mnist.pkl` is pushed to GitHub. Until then "
+                   "the app trains small networks live on a tiny digits dataset.")
+        with st.expander("Details (for debugging)"):
+            st.code(cache_diagnosis(DATASETS[0]))
 
 st.title("Synapse")
 st.caption("A neural network built from first principles in NumPy. Change one thing "
@@ -397,6 +461,16 @@ with tab_attn:
         with c2:
             q = st.selectbox("Show where this word looks", range(len(words)),
                              format_func=lambda i: labels[i], key="q_word")
+            st.bar_chart(pd.DataFrame({"attention weight": weights[q]}, index=labels))
+            st.caption("Each row of the heatmap sums to 1: a word has a fixed "
+                       "budget of attention to spread across all words.")
+
+        with st.expander("The math behind it"):
+            st.latex(r"\text{scores} = \frac{QK^{T}}{\sqrt{d}} \qquad "
+                     r"\text{weights} = \mathrm{softmax}(\text{scores}) \qquad "
+                     r"\text{output} = \text{weights} \cdot V")
+            st.write("Softmax is the same function the network's output layer uses "
+                     "to turn scores into probabilities.")
             st.bar_chart(pd.DataFrame({"attention weight": weights[q]}, index=labels))
             st.caption("Each row of the heatmap sums to 1: a word has a fixed "
                        "budget of attention to spread across all words.")
