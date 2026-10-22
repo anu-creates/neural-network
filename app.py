@@ -4,9 +4,15 @@ Synapse - interactive explorer for the from-scratch neural network.
 Run from the project folder (the one containing neural_network.py):
     streamlit run app.py
 
-Every network you see here is trained live by neural_network.py (pure NumPy).
+By default the app shows saved results: networks trained once on ALL 60,000
+MNIST training images (by precompute.py) with the exact settings of the report,
+so everything appears instantly. The "Advanced" box lets you train your own
+networks live, on fewer images so it finishes in seconds. Either way, every
+network is trained by neural_network.py (pure NumPy).
 """
 
+import os
+import pickle
 import time
 import zlib
 
@@ -23,6 +29,8 @@ from neural_network import ACTIVATIONS, NeuralNetwork
 
 INITS = ["zeros", "random", "xavier", "he"]
 DATASETS = ["MNIST (60k images)", "Small digits (fast)"]
+CACHE_DIR = "precomputed"
+CACHE_FILES = {DATASETS[0]: "mnist.pkl", DATASETS[1]: "small.pkl"}
 
 st.set_page_config(page_title="Synapse", layout="wide")
 
@@ -37,9 +45,11 @@ def get_data(name):
 
 
 @st.cache_resource(show_spinner=False)
-def train_model(dataset, activation, init, hidden, epochs, lr, batch):
+def train_model(dataset, activation, init, hidden, epochs, lr, batch, n_train=None):
     """Train one network with the given settings and return its history."""
     X_train, X_test, y_train, y_test = get_data(dataset)
+    if n_train:
+        X_train, y_train = X_train[:n_train], y_train[:n_train]
     net = NeuralNetwork(X_train.shape[1], hidden, 10,
                         activation=activation, init_method=init, seed=0)
     t0 = time.time()
@@ -57,8 +67,36 @@ def train_model(dataset, activation, init, hidden, epochs, lr, batch):
     }
 
 
+@st.cache_resource(show_spinner=False)
+def _load_precomputed(path, mtime):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def precomputed_for(dataset):
+    """Results saved by precompute.py for this dataset, or None if missing."""
+    path = os.path.join(CACHE_DIR, CACHE_FILES[dataset])
+    if not os.path.exists(path):
+        return None
+    return _load_precomputed(path, os.path.getmtime(path))
+
+
+def get_result(cfg, act, init):
+    """One trained network's results: instant in Fast mode, trained in Live mode."""
+    if cfg["fast"]:
+        return precomputed_for(cfg["dataset"])["results"][f"{act}|{init}"]
+    return train_model(cfg["dataset"], act, init, cfg["hidden"],
+                       cfg["epochs"], cfg["lr"], cfg["batch"], cfg.get("n_train"))
+
+
 def describe(cfg):
-    return (f"{cfg['dataset']} | {cfg['hidden']} hidden neurons | "
+    if cfg.get("fast"):
+        images = "all 60,000 training images (saved results)"
+    elif cfg.get("n_train"):
+        images = f"{cfg['n_train']:,} training images (live)"
+    else:
+        images = "all training images (live)"
+    return (f"{cfg['dataset']} | {images} | {cfg['hidden']} hidden neurons | "
             f"{cfg['epochs']} epochs | learning rate {cfg['lr']} | "
             f"batch {cfg['batch']}")
 
@@ -71,14 +109,14 @@ def epochs_to_reach(acc_history, target=0.90):
 
 
 def run_many(specs, cfg, state_key):
-    """Train every (activation, init) pair in specs, with a progress bar."""
+    """Fetch every (activation, init) pair in specs (trains them in Live mode)."""
     bar = st.progress(0.0, text="Starting...")
     out = []
     for i, (act, init) in enumerate(specs):
         bar.progress(i / len(specs),
-                     text=f"Training {act} + {init}  ({i + 1} of {len(specs)})...")
-        out.append(train_model(cfg["dataset"], act, init, cfg["hidden"],
-                               cfg["epochs"], cfg["lr"], cfg["batch"]))
+                     text=f"{'Loading' if cfg['fast'] else 'Training'} "
+                          f"{act} + {init}  ({i + 1} of {len(specs)})...")
+        out.append(get_result(cfg, act, init))
     bar.empty()
     st.session_state[state_key] = (dict(cfg), out)
 
@@ -111,7 +149,6 @@ def show_comparison(state_key, label_key):
             "train acc %": round(r["train_acc"] * 100, 2),
             "test acc %": round(r["test_acc"] * 100, 2),
             "epochs to 90% test acc": str(e90) if e90 is not None else "never",
-            "seconds": round(r["seconds"], 1),
         })
     st.dataframe(pd.DataFrame(rows).set_index(label_key))
 
@@ -154,22 +191,58 @@ def toy_attention(tokens, scale, d=8):
 # =====================================================================
 # Sidebar: settings shared by every tab
 # =====================================================================
-st.sidebar.title("Training settings")
-cfg = {
-    "dataset": st.sidebar.radio("Dataset", DATASETS, key="dataset"),
-    "hidden": st.sidebar.slider("Hidden neurons", 8, 128, 64, step=8, key="hidden"),
-    "epochs": st.sidebar.slider("Epochs", 1, 30, 10, key="epochs"),
-    "lr": st.sidebar.select_slider("Learning rate", [0.01, 0.03, 0.1, 0.3, 0.5],
-                                   value=0.1, key="lr"),
-    "batch": st.sidebar.select_slider("Batch size", [32, 64, 128, 256],
-                                      value=128, key="batch"),
-}
-st.sidebar.caption("Seed is fixed, so every run is reproducible. Re-running the "
-                   "same settings is instant (results are cached).")
+st.sidebar.title("Synapse")
+info_slot = st.sidebar.container()
+
+with st.sidebar.expander("Advanced: train with my own settings"):
+    user_live = st.checkbox("Train my own networks (slow)", key="live")
+    st.caption("Uses fewer images and epochs by default so it finishes in seconds. "
+               "Numbers will differ from the report.")
+    dataset_choice = st.radio("Dataset", DATASETS, key="dataset", disabled=not user_live)
+    hidden = st.slider("Hidden neurons", 8, 128, 64, step=8, key="hidden",
+                       disabled=not user_live)
+    epochs = st.slider("Epochs", 1, 30, 5, key="epochs", disabled=not user_live)
+    lr = st.select_slider("Learning rate", [0.01, 0.03, 0.1, 0.3, 0.5], value=0.1,
+                          key="lr", disabled=not user_live)
+    batch = st.select_slider("Batch size", [32, 64, 128, 256], value=128,
+                             key="batch", disabled=not user_live)
+    n_train = st.select_slider("Training images", [2000, 5000, 10000, 20000, 60000],
+                               value=10000, key="n_train", disabled=not user_live)
+
+pre = None if user_live else precomputed_for(DATASETS[0])
+use_saved = pre is not None
+
+if use_saved:
+    c = pre["config"]
+    cfg = {"dataset": DATASETS[0], "fast": True, "hidden": c["hidden"],
+           "epochs": c["epochs"], "lr": c["lr"], "batch": c["batch"], "n_train": None}
+else:
+    cfg = {"dataset": dataset_choice if user_live else DATASETS[0], "fast": False,
+           "hidden": hidden, "epochs": epochs, "lr": lr, "batch": batch,
+           "n_train": n_train}
+
+with info_slot:
+    if use_saved:
+        st.markdown("**Showing saved results**")
+        st.markdown(f"Trained on all **60,000** MNIST training images; accuracy is "
+                    f"measured on 10,000 unseen test images.  \n"
+                    f"{c['hidden']} hidden neurons, {c['epochs']} epochs, learning "
+                    f"rate {c['lr']}, batch {c['batch']}, seed {c['seed']}.")
+        st.caption("These are the exact settings and results of the report. Nothing "
+                   "is reduced. They were trained once beforehand, so they load "
+                   "instantly.")
+    elif user_live:
+        st.markdown("**Training live with your settings**")
+        st.caption("Each network trains when you press Run. Results will not match "
+                   "the report unless you use the same settings and all images.")
+    else:
+        st.warning("No saved MNIST results found yet. Run `python precompute.py` once "
+                   "in the project folder (about 10 minutes). Until then the app "
+                   "trains small networks live.")
 
 st.title("Synapse")
-st.caption("A neural network built from first principles in NumPy, trained live. "
-           "Change one thing at a time and watch what happens.")
+st.caption("A neural network built from first principles in NumPy. Change one thing "
+           "at a time and watch what happens.")
 
 tab_act, tab_init, tab_neuron, tab_attn = st.tabs(
     ["Activation functions", "Weight initialization",
@@ -216,30 +289,35 @@ with tab_neuron:
                          index=list(ACTIVATIONS).index("relu"), key="n_act")
     n_init = c2.selectbox("Initialization", INITS, index=3, key="n_init")
 
-    if st.button("Train and analyze", key="run_neuron"):
-        with st.spinner("Training, then silencing each neuron one at a time..."):
-            res = train_model(cfg["dataset"], n_act, n_init, cfg["hidden"],
-                              cfg["epochs"], cfg["lr"], cfg["batch"])
-            net = res["net"]
-            _, X_test, _, y_test = get_data(cfg["dataset"])
-            ablation = net.neuron_importance(X_test, y_test)
-            magnitude = net.neuron_activation_magnitude(X_test)
-            if np.ptp(ablation) == 0 or np.ptp(magnitude) == 0:
-                rho = float("nan")
-            else:
-                rho = float(spearmanr(ablation, magnitude)[0])
+    if st.button("Show neuron analysis" if cfg["fast"] else "Train and analyze",
+                 key="run_neuron"):
+        with st.spinner("Working..."):
+            res = get_result(cfg, n_act, n_init)
+            if "ablation" in res:          # Fast mode: analysis was precomputed
+                ablation, magnitude = res["ablation"], res["magnitude"]
+                rho, W1 = res["rho"], res["W1"]
+            else:                          # Live mode: silence each neuron now
+                net = res["net"]
+                _, X_test, _, y_test = get_data(cfg["dataset"])
+                ablation = net.neuron_importance(X_test, y_test)
+                magnitude = net.neuron_activation_magnitude(X_test)
+                if np.ptp(ablation) == 0 or np.ptp(magnitude) == 0:
+                    rho = float("nan")
+                else:
+                    rho = float(spearmanr(ablation, magnitude)[0])
+                W1 = net.W1.copy()
             st.session_state["neuron"] = (dict(cfg), {
                 "label": f"{n_act} + {n_init}",
                 "test_acc": res["test_acc"],
                 "ablation": ablation,
                 "magnitude": magnitude,
                 "rho": rho,
-                "W1": net.W1.copy(),
+                "W1": W1,
             })
 
     saved = st.session_state.get("neuron")
     if not saved:
-        st.info("Press the button to train a network and analyze its neurons.")
+        st.info("Press the button to analyze a network's neurons.")
     else:
         cfg_used, r = saved
         ablation, magnitude, W1 = r["ablation"], r["magnitude"], r["W1"]
